@@ -2,8 +2,6 @@
 
 A small Windows utility that changes the desktop wallpaper, Windows accent colour and an optional external command as a single theme.
 
-The application is not tied to Lenovo hardware. Lenovo Legion Toolkit commands such as `llt rgb set 2` are optional commands entered per wallpaper.
-
 ## Features
 
 - Separate day and night time ranges
@@ -69,7 +67,8 @@ Configurations can also be saved to and loaded from separate JSON files.
 
 ## External commands
 
-Commands are optional and are not required for wallpaper or accent-colour changes. Example for Lenovo Legion Toolkit:
+Commands are optional and are not required for wallpaper or accent-colour changes (I suggest you to generate them with LLMs if you need personalized commands). 
+Example for Lenovo Legion Toolkit to change keyboard color profile:
 
 ```text
 llt rgb set 2
