@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     from PIL import Image, ImageTk
@@ -69,6 +69,16 @@ def ipc_state_path() -> Path:
     return app_data_dir() / "ipc.json"
 
 
+def ipc_request_path() -> Path:
+    """Return the fallback command file used to wake a hidden instance."""
+    return app_data_dir() / "ipc_request.json"
+
+
+def ipc_token() -> str:
+    seed = f"{APP_SLUG}|{app_data_dir()}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
 def preview_cache_dir() -> Path:
     """Return the cache used by the Windows thumbnail fallback."""
     path = app_data_dir() / "preview_cache"
@@ -109,6 +119,57 @@ def in_time_range(now: dtime, start: dtime, end: dtime) -> bool:
         return start <= now < end
     return now >= start or now < end
 
+
+
+def choose_windows_native_colour(parent_hwnd: int, initial_colour: str) -> Optional[str]:
+    """Open the native Windows colour picker and return a ``#rrggbb`` value.
+
+    Tk's ``tk_chooseColor`` can return the original colour on some Windows/Tk
+    combinations even after the user confirms a different selection. Calling
+    ``ChooseColorW`` directly avoids that wrapper issue. ``None`` means that
+    the dialog was cancelled.
+    """
+    if os.name != "nt" or ctypes is None or wintypes is None:
+        raise RuntimeError("The native Windows colour picker is unavailable.")
+
+    initial_colour = normalize_hex(initial_colour)
+    rgb = int(initial_colour[1:], 16)
+    red = (rgb >> 16) & 0xFF
+    green = (rgb >> 8) & 0xFF
+    blue = rgb & 0xFF
+
+    class CHOOSECOLORW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD),
+            ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HANDLE),
+            ("rgbResult", wintypes.DWORD),
+            ("lpCustColors", ctypes.POINTER(wintypes.DWORD)),
+            ("Flags", wintypes.DWORD),
+            ("lCustData", wintypes.LPARAM),
+            ("lpfnHook", ctypes.c_void_p),
+            ("lpTemplateName", wintypes.LPCWSTR),
+        ]
+
+    custom_colours = (wintypes.DWORD * 16)()
+    chooser = CHOOSECOLORW()
+    chooser.lStructSize = ctypes.sizeof(CHOOSECOLORW)
+    chooser.hwndOwner = parent_hwnd
+    chooser.rgbResult = red | (green << 8) | (blue << 16)
+    chooser.lpCustColors = custom_colours
+    chooser.Flags = 0x00000001 | 0x00000002  # CC_RGBINIT | CC_FULLOPEN
+
+    choose_colour = ctypes.windll.comdlg32.ChooseColorW
+    choose_colour.argtypes = [ctypes.POINTER(CHOOSECOLORW)]
+    choose_colour.restype = wintypes.BOOL
+    if not choose_colour(ctypes.byref(chooser)):
+        return None
+
+    selected = int(chooser.rgbResult)
+    selected_red = selected & 0xFF
+    selected_green = (selected >> 8) & 0xFF
+    selected_blue = (selected >> 16) & 0xFF
+    return f"#{selected_red:02x}{selected_green:02x}{selected_blue:02x}"
 
 
 def windows_uses_dark_apps() -> bool:
@@ -172,6 +233,43 @@ def get_current_wallpaper() -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def get_primary_work_area(root: tk.Tk) -> tuple[int, int, int, int]:
+    """Return the usable primary-screen area, excluding the Windows taskbar."""
+    if os.name == "nt" and ctypes is not None and wintypes is not None:
+        try:
+            rectangle = wintypes.RECT()
+            success = ctypes.windll.user32.SystemParametersInfoW(
+                0x0030,  # SPI_GETWORKAREA
+                0,
+                ctypes.byref(rectangle),
+                0,
+            )
+            if success:
+                return rectangle.left, rectangle.top, rectangle.right, rectangle.bottom
+        except Exception:
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def apply_initial_window_geometry(root: tk.Tk) -> None:
+    """Open the application fully inside the usable desktop area."""
+    root.update_idletasks()
+    left, top, right, bottom = get_primary_work_area(root)
+    work_width = max(1, right - left)
+    work_height = max(1, bottom - top)
+    margin = 18
+
+    width = min(1180, max(900, work_width - margin * 2))
+    height = min(740, max(600, work_height - margin * 2))
+    width = min(width, work_width)
+    height = min(height, work_height)
+
+    x = left + max(0, (work_width - width) // 2)
+    y = top + max(0, (work_height - height) // 2)
+    root.geometry(f"{width}x{height}+{x}+{y}")
+    root.minsize(min(980, width), min(620, height))
 
 
 @dataclass
@@ -332,9 +430,10 @@ class SingleInstanceLock:
             self.file = open(self.path, "r+b")
         except FileNotFoundError:
             self.file = open(self.path, "w+b")
-        self.file.seek(0)
-        self.file.write(b"0")
-        self.file.flush()
+            self.file.write(b"0")
+            self.file.flush()
+        # Do not rewrite an existing lock file. A second process may open the
+        # file while the first process owns its first-byte lock.
         try:
             if os.name == "nt":
                 import msvcrt
@@ -380,8 +479,7 @@ class IPCServer(threading.Thread):
         self.event_queue = event_queue
         self.stop_event = threading.Event()
         self.server_socket: Optional[socket.socket] = None
-        seed = f"{APP_SLUG}|{app_data_dir()}"
-        self.token = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        self.token = ipc_token()
 
     def start_server(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -438,8 +536,26 @@ class IPCServer(threading.Thread):
             pass
 
 
+def write_ipc_request(command: str) -> bool:
+    """Atomically write a fallback request for the hidden primary instance."""
+    try:
+        target = ipc_request_path()
+        temporary = target.with_suffix(".tmp")
+        payload = {
+            "token": ipc_token(),
+            "command": command.upper(),
+            "request_id": os.urandom(12).hex(),
+            "created_at": datetime.now().timestamp(),
+        }
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        temporary.replace(target)
+        return True
+    except Exception:
+        return False
+
+
 def send_to_existing_instance(command: str) -> bool:
-    """Send a command to the primary instance, retrying briefly during startup."""
+    """Send a command to the primary instance, with a file-based fallback."""
     for _ in range(12):
         try:
             state = json.loads(ipc_state_path().read_text(encoding="utf-8"))
@@ -449,10 +565,15 @@ def send_to_existing_instance(command: str) -> bool:
             with socket.create_connection(("127.0.0.1", port), timeout=0.4) as client:
                 client.sendall(payload)
                 reply = client.recv(512)
-                return bool(json.loads(reply.decode("utf-8")).get("ok"))
+                if bool(json.loads(reply.decode("utf-8")).get("ok")):
+                    return True
         except Exception:
             threading.Event().wait(0.08)
-    return False
+
+    # A localhost socket can occasionally become unreachable after sleep,
+    # hibernation or a network-stack change. The already-running app polls this
+    # tiny command file, so reopening the .pyw can still restore its window.
+    return write_ipc_request(command)
 
 
 HOTKEY_KEYS = {
@@ -622,6 +743,206 @@ class Scheduler(threading.Thread):
             self.stop_event.wait(seconds)
 
 
+class ColourPickerDialog:
+    """Small in-app RGB picker with deterministic return values.
+
+    It deliberately avoids both ``tk_chooseColor`` and ``ChooseColorW``. Some
+    Windows/Tk combinations return the initial colour even after confirming a
+    different selection, especially when the initial value is pure white.
+    """
+
+    PRESET_COLOURS = (
+        "#ffffff", "#d9d9d9", "#a6a6a6", "#737373", "#404040", "#000000",
+        "#ffadad", "#ffd6a5", "#fdffb6", "#caffbf", "#9bf6ff", "#a0c4ff",
+        "#bdb2ff", "#ffc6ff", "#ff595e", "#ffca3a", "#8ac926", "#1982c4",
+        "#6a4c93", "#e63946", "#f77f00", "#2a9d8f", "#457b9d", "#7b2cbf",
+    )
+
+    def __init__(self, root: tk.Tk, initial_colour: str, colours: dict[str, str]) -> None:
+        self.root = root
+        self.colours = colours
+        self.result: Optional[str] = None
+        self.updating = False
+
+        initial_colour = normalize_hex(initial_colour)
+        rgb = int(initial_colour[1:], 16)
+        self.red = tk.IntVar(value=(rgb >> 16) & 0xFF)
+        self.green = tk.IntVar(value=(rgb >> 8) & 0xFF)
+        self.blue = tk.IntVar(value=rgb & 0xFF)
+        self.hex_value = tk.StringVar(value=initial_colour)
+
+        window = tk.Toplevel(root)
+        self.window = window
+        window.withdraw()
+        window.title("Select accent colour")
+        window.transient(root)
+        window.resizable(False, False)
+        window.configure(bg=colours["background"])
+        window.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        outer = ttk.Frame(window, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        preview_row = ttk.Frame(outer)
+        preview_row.pack(fill="x", pady=(0, 14))
+        self.preview = tk.Frame(
+            preview_row,
+            width=92,
+            height=54,
+            bg=initial_colour,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=colours["border"],
+        )
+        self.preview.pack(side="left")
+        self.preview.pack_propagate(False)
+
+        hex_area = ttk.Frame(preview_row)
+        hex_area.pack(side="left", fill="x", expand=True, padx=(14, 0))
+        ttk.Label(hex_area, text="Hex colour").pack(anchor="w")
+        self.hex_entry = ttk.Entry(hex_area, textvariable=self.hex_value, width=14)
+        self.hex_entry.pack(anchor="w", pady=(4, 0))
+        self.hex_entry.bind("<Return>", self.apply_hex)
+        self.hex_entry.bind("<FocusOut>", self.apply_hex)
+
+        sliders = ttk.Frame(outer)
+        sliders.pack(fill="x")
+        self._build_channel(sliders, "Red", self.red, 0)
+        self._build_channel(sliders, "Green", self.green, 1)
+        self._build_channel(sliders, "Blue", self.blue, 2)
+
+        presets = ttk.LabelFrame(outer, text="Quick colours", style="Section.TLabelframe")
+        presets.pack(fill="x", pady=(14, 0))
+        for index, colour in enumerate(self.PRESET_COLOURS):
+            swatch = tk.Button(
+                presets,
+                bg=colour,
+                activebackground=colour,
+                width=3,
+                height=1,
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=colours["border"],
+                command=lambda value=colour: self.set_colour(value),
+            )
+            swatch.grid(row=index // 8, column=index % 8, padx=3, pady=3)
+
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x", pady=(16, 0))
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="OK", style="Primary.TButton", command=self.accept).pack(
+            side="right", padx=(0, 8)
+        )
+
+        for variable in (self.red, self.green, self.blue):
+            variable.trace_add("write", self.on_rgb_changed)
+
+        window.update_idletasks()
+        width = max(430, window.winfo_reqwidth())
+        height = window.winfo_reqheight()
+        root.update_idletasks()
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        apply_windows_title_bar_theme(window, windows_uses_dark_apps())
+        window.deiconify()
+        window.lift()
+        window.grab_set()
+        self.hex_entry.focus_set()
+        self.hex_entry.selection_range(0, "end")
+
+    def _build_channel(self, parent: ttk.Frame, label: str, variable: tk.IntVar, row: int) -> None:
+        ttk.Label(parent, text=label, width=7).grid(row=row, column=0, sticky="w", pady=4)
+        scale = tk.Scale(
+            parent,
+            from_=0,
+            to=255,
+            orient="horizontal",
+            variable=variable,
+            resolution=1,
+            showvalue=False,
+            sliderlength=18,
+            bd=0,
+            highlightthickness=0,
+            bg=self.colours["background"],
+            activebackground=self.colours["button_active"],
+            troughcolor=self.colours["panel_alt"],
+        )
+        scale.grid(row=row, column=1, sticky="ew", padx=(8, 10), pady=4)
+        spinbox = ttk.Spinbox(parent, from_=0, to=255, textvariable=variable, width=5)
+        spinbox.grid(row=row, column=2, pady=4)
+        parent.columnconfigure(1, weight=1)
+
+    @staticmethod
+    def _bounded_channel(value: object) -> int:
+        try:
+            return max(0, min(255, int(round(float(value)))))
+        except (TypeError, ValueError, tk.TclError):
+            return 0
+
+    def current_colour(self) -> str:
+        red = self._bounded_channel(self.red.get())
+        green = self._bounded_channel(self.green.get())
+        blue = self._bounded_channel(self.blue.get())
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
+    def on_rgb_changed(self, *_args) -> None:
+        if self.updating:
+            return
+        colour = self.current_colour()
+        self.updating = True
+        try:
+            self.hex_value.set(colour)
+            self.preview.configure(bg=colour)
+        finally:
+            self.updating = False
+
+    def apply_hex(self, _event=None) -> None:
+        if self.updating:
+            return
+        try:
+            colour = normalize_hex(self.hex_value.get())
+        except ValueError:
+            self.hex_value.set(self.current_colour())
+            return
+        self.set_colour(colour)
+
+    def set_colour(self, colour: str) -> None:
+        colour = normalize_hex(colour)
+        rgb = int(colour[1:], 16)
+        self.updating = True
+        try:
+            self.red.set((rgb >> 16) & 0xFF)
+            self.green.set((rgb >> 8) & 0xFF)
+            self.blue.set(rgb & 0xFF)
+            self.hex_value.set(colour)
+            self.preview.configure(bg=colour)
+        finally:
+            self.updating = False
+
+    def accept(self) -> None:
+        self.apply_hex()
+        self.result = self.current_colour()
+        self.close()
+
+    def cancel(self) -> None:
+        self.result = None
+        self.close()
+
+    def close(self) -> None:
+        try:
+            self.window.grab_release()
+        except tk.TclError:
+            pass
+        self.window.destroy()
+
+    def show(self) -> Optional[str]:
+        self.root.wait_window(self.window)
+        return self.result
+
+
 class NotificationOverlay:
     """Bottom-centre on-screen notification similar to a compact Windows OSD."""
 
@@ -693,8 +1014,7 @@ class WallpaperApp:
         self.root = root
         self.silent = silent
         self.root.title(APP_NAME)
-        self.root.geometry("1180x820")
-        self.root.minsize(980, 680)
+        apply_initial_window_geometry(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
         self.state_lock = threading.RLock()
@@ -707,7 +1027,6 @@ class WallpaperApp:
         self.exiting = False
         self.loading_config = False
         self.current_config_path: Optional[Path] = None
-        self.colour_picker_open = False
 
         self.day_index = 0
         self.night_index = 0
@@ -1218,9 +1537,29 @@ class WallpaperApp:
         for variable, attribute, getter in bindings:
             variable.trace_add("write", lambda *_args, a=attribute, g=getter: setattr(self, a, g()))
 
+    def process_ipc_request_file(self) -> None:
+        """Consume a pending command when socket IPC was unavailable."""
+        target = ipc_request_path()
+        if not target.exists():
+            return
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            target.unlink(missing_ok=True)
+            if payload.get("token") != ipc_token():
+                return
+            command = str(payload.get("command", "")).upper()
+            if command in {"SHOW", "START", "STOP", "CHANGE_NOW", "TOGGLE_COMMANDS", "EXIT"}:
+                self.event_queue.put((command, None))
+        except Exception:
+            try:
+                target.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def process_events(self) -> None:
         if self.exiting:
             return
+        self.process_ipc_request_file()
         while True:
             try:
                 action, payload = self.event_queue.get_nowait()
@@ -1250,16 +1589,33 @@ class WallpaperApp:
             self.root.after(80, self.process_events)
 
     def show_window(self) -> None:
+        """Restore and foreground the hidden primary window."""
         self.silent = False
-        self.root.deiconify()
         try:
+            self.root.deiconify()
             self.root.state("normal")
+            self.root.update_idletasks()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.focus_force()
+
+            if os.name == "nt" and ctypes is not None:
+                hwnd = self.root.winfo_id()
+                user32 = ctypes.windll.user32
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+
+            def release_topmost() -> None:
+                try:
+                    self.root.attributes("-topmost", False)
+                    self.root.lift()
+                except tk.TclError:
+                    pass
+
+            self.root.after(300, release_topmost)
         except tk.TclError:
-            pass
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        self.root.after(180, lambda: self.root.attributes("-topmost", False))
-        self.root.focus_force()
+            return
         self.update_status()
 
     def on_window_close(self) -> None:
@@ -1590,6 +1946,8 @@ try {{
         ).grid(row=grid_row, column=3, padx=5, pady=2, sticky="ew")
 
         hex_variable = tk.StringVar(value=image.colour)
+        colour_state = {"dialog_open": False, "programmatic": False}
+
         colour_button = tk.Button(
             self.image_grid,
             bg=image.colour,
@@ -1600,7 +1958,20 @@ try {{
             bd=0,
             highlightthickness=1,
             highlightbackground=self.colours["border"],
-            command=lambda: self.choose_colour(image, colour_button, hex_variable),
+            takefocus=False,
+        )
+        colour_button.configure(
+            command=lambda: self.choose_colour(
+                image, colour_button, hex_variable, colour_state
+            )
+        )
+        # ButtonPress happens before the Hex field's FocusOut callback. Marking
+        # the dialog here prevents that callback from overwriting the first
+        # colour selected in the native picker.
+        colour_button.bind(
+            "<ButtonPress-1>",
+            lambda _event: colour_state.__setitem__("dialog_open", True),
+            add="+",
         )
         colour_button.grid(row=grid_row, column=4, padx=5, pady=2)
 
@@ -1608,7 +1979,7 @@ try {{
         hex_entry.grid(row=grid_row, column=5, sticky="ew", padx=5, pady=2)
 
         def apply_hex(_event=None) -> None:
-            if self.colour_picker_open:
+            if colour_state["dialog_open"] or colour_state["programmatic"]:
                 return
             try:
                 colour = normalize_hex(hex_variable.get())
@@ -1618,18 +1989,19 @@ try {{
                 except tk.TclError:
                     pass
                 return
-            with self.state_lock:
-                image.colour = colour
-            colour_button.configure(bg=colour, activebackground=colour)
-            hex_variable.set(colour)
+            self.commit_image_colour(image, colour, colour_button, hex_variable, colour_state)
             try:
                 hex_entry.configure(foreground=self.colours["foreground"])
             except tk.TclError:
                 pass
-            self.save_last_config_safely()
 
         hex_entry.bind("<Return>", apply_hex)
-        hex_entry.bind("<FocusOut>", apply_hex)
+        # Delay validation until the click target has had a chance to mark a
+        # colour-dialog interaction.
+        hex_entry.bind(
+            "<FocusOut>",
+            lambda _event: self.root.after_idle(apply_hex),
+        )
 
         day_variable = tk.BooleanVar(value=image.in_day)
         night_variable = tk.BooleanVar(value=image.in_night)
@@ -1669,44 +2041,65 @@ try {{
         command_entry.bind("<FocusOut>", update_command)
         command_entry.bind("<Return>", update_command)
 
-    def choose_colour(self, image: ImageEntry, button: tk.Button, variable: tk.StringVar) -> None:
-        # Opening the native dialog moves focus away from the Hex entry. Without
-        # this guard, its FocusOut handler can race with the first picker change
-        # and restore the previous value immediately after the dialog closes.
+    def commit_image_colour(
+        self,
+        image: ImageEntry,
+        colour: str,
+        button: tk.Button,
+        variable: tk.StringVar,
+        colour_state: dict[str, bool],
+    ) -> None:
+        """Commit a row colour to both the UI object and the live image list."""
+        colour = normalize_hex(colour)
+        colour_state["programmatic"] = True
+        try:
+            with self.state_lock:
+                image.colour = colour
+                image_key = path_key(image.path)
+                for live_image in self.images:
+                    if path_key(live_image.path) == image_key:
+                        live_image.colour = colour
+                        break
+            variable.set(colour)
+            button.configure(bg=colour, activebackground=colour)
+            self.save_last_config_safely()
+        finally:
+            colour_state["programmatic"] = False
+
+    def choose_colour(
+        self,
+        image: ImageEntry,
+        button: tk.Button,
+        variable: tk.StringVar,
+        colour_state: dict[str, bool],
+    ) -> None:
         try:
             initial_colour = normalize_hex(variable.get())
         except ValueError:
             initial_colour = normalize_hex(image.colour)
 
-        self.colour_picker_open = True
+        colour_state["dialog_open"] = True
         try:
-            rgb_values, selected = colorchooser.askcolor(
-                parent=self.root,
-                color=initial_colour,
-                title="Select accent colour",
-            )
-            if not selected:
-                return
-
-            if rgb_values is not None:
-                red, green, blue = (max(0, min(255, round(value))) for value in rgb_values)
-                selected = f"#{red:02x}{green:02x}{blue:02x}"
-            else:
-                selected = normalize_hex(selected)
-
-            with self.state_lock:
-                image.colour = selected
-            variable.set(selected)
-            button.configure(bg=selected, activebackground=selected)
-            self.save_last_config_safely()
-            self.root.update_idletasks()
+            selected = ColourPickerDialog(
+                self.root,
+                initial_colour,
+                self.colours,
+            ).show()
+            if selected is not None:
+                self.commit_image_colour(
+                    image,
+                    selected,
+                    button,
+                    variable,
+                    colour_state,
+                )
+                # Explicit repaint makes the update visible before focus returns
+                # to the Hex field.
+                button.update()
+                self.root.update_idletasks()
         finally:
-            # Native Windows dialogs can post their final focus event just after
-            # askcolor returns, so release the guard after that event has settled.
-            self.root.after(100, self.finish_colour_picker)
-
-    def finish_colour_picker(self) -> None:
-        self.colour_picker_open = False
+            # Keep the guard active until delayed FocusOut callbacks have run.
+            self.root.after(25, lambda state=colour_state: state.__setitem__("dialog_open", False))
 
     def set_active_image(self, image_path: str) -> None:
         self.active_image_path = image_path
@@ -2145,6 +2538,10 @@ try {{
             self.hotkey_manager.stop()
             self.hotkey_manager = None
         self.save_last_config_safely()
+        try:
+            ipc_request_path().unlink(missing_ok=True)
+        except Exception:
+            pass
         self.root.destroy()
 
 
