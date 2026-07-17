@@ -2,6 +2,10 @@
 
 A small Windows utility that changes the desktop wallpaper, Windows accent colour and an optional external command as a single theme.
 
+## Preview
+
+![Themes page of Windows Wallpaper, Accent Color & External Command Scheduler](assets/themes-preview.png)
+
 ## Features
 
 - Separate day and night time ranges
