@@ -707,6 +707,7 @@ class WallpaperApp:
         self.exiting = False
         self.loading_config = False
         self.current_config_path: Optional[Path] = None
+        self.colour_picker_open = False
 
         self.day_index = 0
         self.night_index = 0
@@ -1062,10 +1063,10 @@ class WallpaperApp:
 
     def build_wallpapers_section(self, parent: ttk.Frame) -> None:
         wallpaper_box = ttk.LabelFrame(parent, text="Wallpapers", style="Section.TLabelframe")
-        wallpaper_box.pack(fill="both", expand=True, pady=(0, 12))
+        wallpaper_box.pack(fill="both", expand=True, pady=(0, 10))
 
         toolbar = ttk.Frame(wallpaper_box)
-        toolbar.pack(fill="x", pady=(0, 8))
+        toolbar.pack(fill="x", pady=(0, 6))
         ttk.Label(
             toolbar,
             text="Only selected wallpapers are used. Commands run after the matching wallpaper is applied.",
@@ -1083,7 +1084,7 @@ class WallpaperApp:
             highlightbackground=self.colours["border"],
             bg=self.colours["panel"],
             bd=0,
-            height=360,
+            height=300,
         )
         scrollbar = ttk.Scrollbar(
             container,
@@ -1091,7 +1092,7 @@ class WallpaperApp:
             command=self.wallpaper_canvas.yview,
             style="Vertical.TScrollbar",
         )
-        self.image_grid = ttk.Frame(self.wallpaper_canvas, style="Panel.TFrame", padding=(8, 4))
+        self.image_grid = ttk.Frame(self.wallpaper_canvas, style="Panel.TFrame", padding=(8, 2))
         self.image_window_id = self.wallpaper_canvas.create_window(
             (0, 0), window=self.image_grid, anchor="nw"
         )
@@ -1134,7 +1135,7 @@ class WallpaperApp:
         ]
         for text, column in headings:
             ttk.Label(self.image_grid, text=text, style="PanelStatus.TLabel").grid(
-                row=0, column=column, sticky="w", padx=5, pady=(5, 8)
+                row=0, column=column, sticky="w", padx=5, pady=(3, 5)
             )
         ttk.Separator(self.image_grid, orient="horizontal").grid(
             row=1, column=0, columnspan=9, sticky="ew"
@@ -1430,7 +1431,7 @@ class WallpaperApp:
             grid_row = 2 + index * 2
             self.add_image_row(image, grid_row)
             ttk.Separator(self.image_grid, orient="horizontal").grid(
-                row=grid_row + 1, column=0, columnspan=9, sticky="ew", pady=(3, 0)
+                row=grid_row + 1, column=0, columnspan=9, sticky="ew", pady=(1, 0)
             )
         self.refresh_active_markers()
 
@@ -1549,7 +1550,7 @@ try {{
             font=("Segoe UI Symbol", 14),
             anchor="center",
         )
-        marker.grid(row=grid_row, column=0, padx=5, pady=6, sticky="nsew")
+        marker.grid(row=grid_row, column=0, padx=5, pady=2, sticky="nsew")
         self.active_markers[key] = marker
 
         enabled_variable = tk.BooleanVar(value=image.enabled)
@@ -1565,28 +1566,28 @@ try {{
             variable=enabled_variable,
             command=update_enabled,
             style="Row.TCheckbutton",
-        ).grid(row=grid_row, column=1, padx=5, pady=6)
+        ).grid(row=grid_row, column=1, padx=5, pady=2)
 
         preview = self.create_preview(image.path)
         if preview is not None:
             self.preview_references.append(preview)
             preview_label = ttk.Label(self.image_grid, image=preview, style="Panel.TLabel")
             preview_label.image = preview  # Keep a widget-local Tk image reference.
-            preview_label.grid(row=grid_row, column=2, padx=5, pady=6, sticky="w")
+            preview_label.grid(row=grid_row, column=2, padx=5, pady=2, sticky="w")
         else:
             ttk.Label(
                 self.image_grid,
                 text="No preview",
                 style="PanelSubtitle.TLabel",
                 anchor="center",
-            ).grid(row=grid_row, column=2, padx=5, pady=6, sticky="ew")
+            ).grid(row=grid_row, column=2, padx=5, pady=2, sticky="ew")
 
         ttk.Label(
             self.image_grid,
             text=Path(image.path).name,
             style="Panel.TLabel",
             anchor="w",
-        ).grid(row=grid_row, column=3, padx=5, pady=6, sticky="ew")
+        ).grid(row=grid_row, column=3, padx=5, pady=2, sticky="ew")
 
         hex_variable = tk.StringVar(value=image.colour)
         colour_button = tk.Button(
@@ -1601,12 +1602,14 @@ try {{
             highlightbackground=self.colours["border"],
             command=lambda: self.choose_colour(image, colour_button, hex_variable),
         )
-        colour_button.grid(row=grid_row, column=4, padx=5, pady=6)
+        colour_button.grid(row=grid_row, column=4, padx=5, pady=2)
 
         hex_entry = ttk.Entry(self.image_grid, textvariable=hex_variable, width=10)
-        hex_entry.grid(row=grid_row, column=5, sticky="ew", padx=5, pady=6)
+        hex_entry.grid(row=grid_row, column=5, sticky="ew", padx=5, pady=2)
 
         def apply_hex(_event=None) -> None:
+            if self.colour_picker_open:
+                return
             try:
                 colour = normalize_hex(hex_variable.get())
             except ValueError:
@@ -1646,17 +1649,17 @@ try {{
             variable=day_variable,
             command=update_day,
             style="Row.TCheckbutton",
-        ).grid(row=grid_row, column=6, padx=5, pady=6)
+        ).grid(row=grid_row, column=6, padx=5, pady=2)
         ttk.Checkbutton(
             self.image_grid,
             variable=night_variable,
             command=update_night,
             style="Row.TCheckbutton",
-        ).grid(row=grid_row, column=7, padx=5, pady=6)
+        ).grid(row=grid_row, column=7, padx=5, pady=2)
 
         command_variable = tk.StringVar(value=image.command)
         command_entry = ttk.Entry(self.image_grid, textvariable=command_variable)
-        command_entry.grid(row=grid_row, column=8, sticky="ew", padx=5, pady=6)
+        command_entry.grid(row=grid_row, column=8, sticky="ew", padx=5, pady=2)
 
         def update_command(_event=None) -> None:
             with self.state_lock:
@@ -1667,14 +1670,43 @@ try {{
         command_entry.bind("<Return>", update_command)
 
     def choose_colour(self, image: ImageEntry, button: tk.Button, variable: tk.StringVar) -> None:
-        selected = colorchooser.askcolor(color=image.colour, title="Select accent colour")[1]
-        if selected:
-            selected = normalize_hex(selected)
+        # Opening the native dialog moves focus away from the Hex entry. Without
+        # this guard, its FocusOut handler can race with the first picker change
+        # and restore the previous value immediately after the dialog closes.
+        try:
+            initial_colour = normalize_hex(variable.get())
+        except ValueError:
+            initial_colour = normalize_hex(image.colour)
+
+        self.colour_picker_open = True
+        try:
+            rgb_values, selected = colorchooser.askcolor(
+                parent=self.root,
+                color=initial_colour,
+                title="Select accent colour",
+            )
+            if not selected:
+                return
+
+            if rgb_values is not None:
+                red, green, blue = (max(0, min(255, round(value))) for value in rgb_values)
+                selected = f"#{red:02x}{green:02x}{blue:02x}"
+            else:
+                selected = normalize_hex(selected)
+
             with self.state_lock:
                 image.colour = selected
-            button.configure(bg=selected, activebackground=selected)
             variable.set(selected)
+            button.configure(bg=selected, activebackground=selected)
             self.save_last_config_safely()
+            self.root.update_idletasks()
+        finally:
+            # Native Windows dialogs can post their final focus event just after
+            # askcolor returns, so release the guard after that event has settled.
+            self.root.after(100, self.finish_colour_picker)
+
+    def finish_colour_picker(self) -> None:
+        self.colour_picker_open = False
 
     def set_active_image(self, image_path: str) -> None:
         self.active_image_path = image_path
